@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.utils.data
+        # Evaluate best/last model on val and test sets and append to run summary
 import yaml
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -96,7 +97,8 @@ def train(hyp, opt, device, tb_writer=None):
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
-    test_path = data_dict['val']
+    val_path = data_dict['val']
+    test_path = data_dict['test'] if 'test' in data_dict else val_path
 
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
@@ -252,7 +254,7 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Process 0
     if rank in [-1, 0]:
-        testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
+        testloader = create_dataloader(val_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
                                        world_size=opt.world_size, workers=opt.workers,
                                        pad=0.5, prefix=colorstr('val: '))[0]
@@ -479,6 +481,16 @@ def train(hyp, opt, device, tb_writer=None):
                 del ckpt
 
         # end epoch ----------------------------------------------------------------------------------------------------
+    
+    # Run post-training evaluation on the saved final model and append summary
+    log_wandb_summary(wandb_logger, opt, device, best if best.exists() else last, testloader, task='val')
+    #Create a dataloader for the test dataset
+    testloader2 = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
+                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
+                                       world_size=opt.world_size, workers=opt.workers,
+                                       pad=0.5, prefix=colorstr('test: '))[0]
+    log_wandb_summary(wandb_logger, opt, device, best if best.exists() else last, testloader2, task='test')
+    
     # end training
     if rank in [-1, 0]:
         # Plots
@@ -522,6 +534,43 @@ def train(hyp, opt, device, tb_writer=None):
         dist.destroy_process_group()
     torch.cuda.empty_cache()
     return results
+ 
+def log_wandb_summary(wandb_logger, opt, device, weights_path, dataloader, task='val'):
+    """Log best model metrics to W&B run summary for val or test dataset."""
+    if not wandb_logger or not wandb_logger.wandb:
+        return
+    
+    try:
+        # Call test.py in non-training mode by passing the weights path
+        # Ensure `imgsz` is a scalar (use test/img size) not the [train, test] list
+        imgsz = opt.img_size[1] if isinstance(opt.img_size, (list, tuple)) and len(opt.img_size) > 1 else opt.img_size
+        model = attempt_load(weights_path, device).half()  # load model
+
+
+        results, maps, times = test.test(opt.data,
+                                                weights=str(weights_path),
+                                                batch_size=opt.batch_size,
+                                                model=model,
+                                                dataloader=dataloader,
+                                                imgsz=imgsz,
+                                                single_cls=opt.single_cls,
+                                                v5_metric=getattr(opt, 'v5_metric', False))
+        
+        # Log to W&B run summary (appears in Results tab)
+        # Run summary stores final metrics, not history
+        summary_dict = {
+            f'best/{task}/mAP_0.5': float(results[2]),
+            f'best/{task}/mAP_0.5:0.95': float(results[3]),
+            f'best/{task}/precision': float(results[0]),
+            f'best/{task}/recall': float(results[1]),
+        }
+        
+        # Update run summary (final metrics)
+        wandb_logger.log(summary_dict)
+        logger.info(f"Logged best/{task} metrics to W&B summary: {summary_dict}")
+        
+    except Exception as e:
+        logger.warning(f"Failed to log {task} summary metrics to W&B: {e}")
 
 
 if __name__ == '__main__':
